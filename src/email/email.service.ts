@@ -21,7 +21,7 @@ export class EmailService implements OnModuleInit {
     console.log('📧 Ethereal test account created:', testAccount.user);
   }
 
-    async sendVerificationEmail(to: string, code: string, token: string) {
+  async sendVerificationEmail(to: string, code: string, token: string) {
     const verifyLink = `http://localhost:3000/auth/verify-email/${token}`;
 
     const info = await this.transporter.sendMail({
@@ -29,11 +29,34 @@ export class EmailService implements OnModuleInit {
       to,
       subject: 'Подтвердите email',
       html: `
-        <p>Ваш код подтверждения: <b>${code}</b></p>
-        <p>Или перейдите по ссылке: <a href="${verifyLink}">${verifyLink}</a></p>
-      `,
+          <p>Ваш код подтверждения: <b>${code}</b></p>
+          <p>Или перейдите по ссылке: <a href="${verifyLink}">ACTIVE</a></p>
+        `,
     });
 
-    console.log('📨 Письмо отправлено, посмотреть можно здесь:', nodemailer.getTestMessageUrl(info));
+    console.log(
+      '📨 Письмо отправлено, посмотреть можно здесь:',
+      nodemailer.getTestMessageUrl(info),
+    );
+  }
+
+  async sendPasswordResetEmail(to: string, token: string) {
+    const resetLink = `http://localhost:3000/auth/reset-password/${token}`;
+
+    const info = await this.transporter.sendMail({
+      from: '"Chat Alpha" <no-reply@chat-alpha.dev>',
+      to,
+      subject: 'Сброс пароля',
+      html: `
+        <p>Вы запросили сброс пароля.</p>
+        <p>Перейдите по ссылке, чтобы задать новый пароль: <a href="${resetLink}">${resetLink}</a></p>
+        <p>Если это были не вы — просто проигнорируйте это письмо.</p>
+    `,
+    });
+
+    console.log(
+      '📨 Письмо сброса пароля отправлено:',
+      nodemailer.getTestMessageUrl(info),
+    );
   }
 }
