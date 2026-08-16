@@ -1,16 +1,18 @@
 services:
   postgres:
     image: postgres:16
-    container_name: chat-alpha-db
+    container_name: chat-alpha-auth-db
     restart: unless-stopped
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: chat-alpha
+      POSTGRES_DB: chat_alpha_auth
     ports:
       - '5432:5432'
     volumes:
       - pgdata:/var/lib/postgresql/data
+    networks:
+      - chat-alpha-network
 
   redis:
     image: redis:7-alpine
@@ -20,7 +22,26 @@ services:
       - '6379:6379'
     volumes:
       - redisdata:/data
+    networks:
+      - chat-alpha-network
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: chat-alpha-rabbitmq
+    restart: unless-stopped
+    ports:
+      - '5672:5672'
+      - '15672:15672'
+    environment:
+      RABBITMQ_DEFAULT_USER: admin
+      RABBITMQ_DEFAULT_PASS: admin
+    networks:
+      - chat-alpha-network
 
 volumes:
   pgdata:
   redisdata:
+
+networks:
+  chat-alpha-network:
+    external: true

@@ -8,12 +8,27 @@ import { PrismaModule } from '../prisma/prisma.module';
 import { EmailModule } from 'src/email/email.module';
 import { RedisModule } from 'src/redis/redis.module';
 import { JwtStrategy } from './jwt/jwt.strategy';
+import { ClientsModule, Transport } from '@nestjs/microservices';
 
 @Module({
   imports: [
     PrismaModule,
     EmailModule,
     RedisModule,
+    ClientsModule.registerAsync([
+      {
+        name: 'RABBITMQ_SERVICE',
+        useFactory: (config: ConfigService) => ({
+          transport: Transport.RMQ,
+          options: {
+            urls: [config.getOrThrow<string>('RABBITMQ_URL')],
+            queue: 'user_events',
+            queueOptions: { durable: true },
+          },
+        }),
+        inject: [ConfigService],
+      },
+    ]),
     JwtModule.registerAsync({
       inject: [ConfigService],
       useFactory: (config: ConfigService) => ({

@@ -18,6 +18,8 @@ import { JwtAuthGuard } from './jwt/jwt-auth.guard';
 import { ForgotPasswordDto } from './dto/forgot-password.dto';
 import { ResetPasswordDto } from './dto/reset-password.dto';
 import { ChangePasswordDto } from './dto/change-password.dto';
+import { TotpCodeDto } from './dto/totp.dto';
+import { TotpLoginDto } from './dto/totp-login.dto';
 
 @Controller('auth')
 export class AuthController {
@@ -84,5 +86,28 @@ export class AuthController {
   @Post('resend-verification')
   resendVerification(@Body() dto: ResendVerificationDto) {
     return this.authService.resendVerificationEmail(dto.email);
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Post('totp/generate')
+  generateTotpSecret(@Req() req: any) {
+    return this.authService.generateTotpSecret(req.user.userId);
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Post('totp/enable')
+  enableTotp(@Req() req: any, @Body() dto: TotpCodeDto) {
+    return this.authService.enableTotp(req.user.userId, dto.code);
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Post('totp/disable')
+  disableTotp(@Req() req: any, @Body() dto: TotpCodeDto) {
+    return this.authService.disableTotp(req.user.userId, dto.code);
+  }
+
+  @Post('totp/login')
+  verifyTotpLogin(@Body() dto: TotpLoginDto) {
+    return this.authService.verifyTotpLogin(dto.tempToken, dto.code);
   }
 }

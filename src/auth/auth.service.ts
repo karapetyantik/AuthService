@@ -1,5 +1,6 @@
 import {
   Injectable,
+  Inject,
   ConflictException,
   UnauthorizedException,
 } from '@nestjs/common';
@@ -13,6 +14,9 @@ import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
 import { EmailService } from 'src/email/email.service';
 import { RedisService } from 'src/redis/redis.service';
+import { generateSecret, generateURI, verify } from 'otplib';
+import * as qrcode from 'qrcode';
+import { ClientProxy } from '@nestjs/microservices';
 
 @Injectable()
 export class AuthService {
@@ -22,6 +26,7 @@ export class AuthService {
     private readonly config: ConfigService,
     private readonly emailService: EmailService,
     private readonly redisService: RedisService,
+    @Inject('RABBITMQ_SERVICE') private readonly rabbitClient: ClientProxy,
   ) {}
 
   async register(dto: RegisterDto) {
@@ -46,6 +51,12 @@ export class AuthService {
 
     await this.sendVerificationEmail(user.email);
 
+    this.rabbitClient.emit('user.registered', {
+      userId: user.id,
+      email: user.email,
+      username: user.username,
+    });
+
     const { passwordHash: _, ...safeUser } = user;
     return safeUser;
   }
@@ -56,9 +67,10 @@ export class AuthService {
     });
     if (!user) {
       throw new UnauthorizedException('Invalid email or password');
-    } else if (user.isEmailVerified === false) {
-      throw new UnauthorizedException('Email not verified');
     }
+    // else if (user.isEmailVerified === false) {
+    //   throw new UnauthorizedException('Email not verified');
+    // }
 
     const isPasswordValid = await bcrypt.compare(
       dto.password,
@@ -68,6 +80,68 @@ export class AuthService {
       throw new UnauthorizedException('Invalid email or password');
     }
 
+    if (user.isTotpEnabled) {
+      const tempToken = await this.jwtService.signAsync(
+        { sub: user.id, email: user.email, purpose: 'totp-login' },
+        { expiresIn: '5m' },
+      );
+      return { requiresTotp: true, tempToken };
+    }
+
+    return this.issueTokens(user.id, user.email);
+  }
+
+  async verifyTotpLogin(tempToken: string, code: string) {
+    let payload: { sub: string; purpose: string };
+    try {
+      payload = await this.jwtService.verifyAsync(tempToken);
+    } catch {
+      throw new UnauthorizedException(
+        'Сессия входа истекла, авторизуйтесь заново',
+      );
+    }
+
+    if (payload.purpose !== 'totp-login') {
+      throw new UnauthorizedException('Неверный тип токена');
+    }
+
+    const blockKey = `totp_blocked:${payload.sub}`;
+    const isBlocked = await this.redisService.client.get(blockKey);
+    if (isBlocked) {
+      throw new UnauthorizedException(
+        'Слишком много неверных попыток. Вход заблокирован на 24 часа.',
+      );
+    }
+    const user = await this.prisma.user.findUnique({
+      where: { id: payload.sub },
+    });
+    if (!user || !user.isTotpEnabled || !user.totpSecret) {
+      throw new UnauthorizedException('2FA не включена');
+    }
+
+    const isValid = await this.verifyTotpCode(
+      payload.sub,
+      user.totpSecret,
+      code,
+    );
+
+    if (!isValid) {
+      const attemptsKey = `totp_attempts:${payload.sub}`;
+      const attempts = await this.redisService.client.incr(attemptsKey);
+      if (attempts === 1) {
+        await this.redisService.client.expire(attemptsKey, 15 * 60);
+      }
+      if (attempts >= 5) {
+        await this.redisService.client.set(blockKey, '1', 'EX', 24 * 60 * 60);
+        await this.redisService.client.del(attemptsKey);
+        throw new UnauthorizedException(
+          'Слишком много неверных попыток. Вход заблокирован на 24 часа.',
+        );
+      }
+      throw new UnauthorizedException('Неверный код');
+    }
+
+    await this.redisService.client.del(`totp_attempts:${payload.sub}`);
     return this.issueTokens(user.id, user.email);
   }
 
@@ -304,5 +378,98 @@ export class AuthService {
 
   private hashToken(token: string): string {
     return createHash('sha256').update(token).digest('hex');
+  }
+
+  async generateTotpSecret(userId: string) {
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    if (!user) {
+      throw new UnauthorizedException('Пользователь не найден');
+    }
+    if (user.isTotpEnabled) {
+      throw new ConflictException('2FA уже включена');
+    }
+    const secret = generateSecret();
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: { totpSecret: secret },
+    });
+
+    const otpAuthUrl = generateURI({
+      issuer: 'ChatApp',
+      label: user.email,
+      secret,
+    });
+
+    const qrCodeDataUrl = await qrcode.toDataURL(otpAuthUrl);
+    return { qrCodeDataUrl, secret };
+  }
+
+  async enableTotp(userId: string, code: string) {
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    if (!user || !user.totpSecret) {
+      throw new UnauthorizedException('Сначала сгенерируйте секрет');
+    }
+    if (user.isTotpEnabled) {
+      throw new UnauthorizedException('2FA уже включена');
+    }
+
+    const isValid = await this.verifyTotpCode(userId, user.totpSecret, code);
+    if (!isValid) {
+      throw new UnauthorizedException('Неверный код 2FA');
+    }
+
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: { isTotpEnabled: true },
+    });
+
+    return { success: true };
+  }
+
+  async disableTotp(userId: string, code: string) {
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    if (!user || !user.totpSecret || !user.isTotpEnabled) {
+      throw new UnauthorizedException('2FA не включена');
+    }
+
+    const isValid = await this.verifyTotpCode(userId, user.totpSecret, code);
+    if (!isValid) {
+      throw new UnauthorizedException('Неверный код 2FA');
+    }
+
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: { isTotpEnabled: false, totpSecret: null },
+    });
+    return { success: true };
+  }
+
+  private async verifyTotpCode(
+    userId: string,
+    secret: string,
+    token: string,
+  ): Promise<boolean> {
+    const result = await verify({ secret, token });
+    if (!result.valid) {
+      return false;
+    }
+
+    const currentStep = Math.floor(Date.now() / 1000 / 30);
+    const usedStep = currentStep + (result.delta ?? 0);
+
+    const lastStepKey = `totp_last_step:${userId}`;
+    const lastStep = await this.redisService.client.get(lastStepKey);
+
+    if (lastStep !== null && Number(lastStep) >= usedStep) {
+      return false;
+    }
+
+    await this.redisService.client.set(
+      lastStepKey,
+      usedStep.toString(),
+      'EX',
+      5 * 60,
+    );
+    return true;
   }
 }
