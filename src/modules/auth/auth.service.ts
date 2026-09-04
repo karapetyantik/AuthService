@@ -3,17 +3,18 @@ import {
   Inject,
   ConflictException,
   UnauthorizedException,
+  BadRequestException,
 } from '@nestjs/common';
 import * as bcrypt from 'bcrypt';
 import { randomBytes, createHash } from 'crypto';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import ms, { StringValue } from 'ms';
-import { PrismaService } from '../prisma/prisma.service';
+import { PrismaService } from '../../common/prisma/prisma.service';
 import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
-import { EmailService } from 'src/email/email.service';
-import { RedisService } from 'src/redis/redis.service';
+import { EmailService } from 'src/modules/email/email.service';
+import { RedisService } from 'src/common/redis/redis.service';
 import { generateSecret, generateURI, verify } from 'otplib';
 import * as qrcode from 'qrcode';
 import { ClientProxy } from '@nestjs/microservices';
@@ -65,8 +66,12 @@ export class AuthService {
     const user = await this.prisma.user.findUnique({
       where: { email: dto.email },
     });
-    if (!user) {
-      throw new UnauthorizedException('Invalid email or password');
+    if (!user || !user.passwordHash) {
+      throw new UnauthorizedException(
+        user
+          ? 'Этот аккаунт использует вход через Google'
+          : 'Неверный email или пароль',
+      );
     }
     // else if (user.isEmailVerified === false) {
     //   throw new UnauthorizedException('Email not verified');
@@ -143,6 +148,65 @@ export class AuthService {
 
     await this.redisService.client.del(`totp_attempts:${payload.sub}`);
     return this.issueTokens(user.id, user.email);
+  }
+
+  async oauthLogin(googleUser: {
+    providerId: string;
+    email: string;
+    displayName: string;
+  }) {
+    let user = await this.prisma.user.findUnique({
+      where: { providerId: googleUser.providerId },
+    });
+
+    if (!user) {
+      const existingByEmail = await this.prisma.user.findUnique({
+        where: { email: googleUser.email },
+      });
+      if (existingByEmail) {
+        user = await this.prisma.user.update({
+          where: { id: existingByEmail.id },
+          data: {
+            provider: 'google',
+            providerId: googleUser.providerId,
+            isEmailVerified: true,
+          },
+        });
+      } else {
+        const username = await this.generateUniqueUsername(
+          googleUser.displayName,
+        );
+        user = await this.prisma.user.create({
+          data: {
+            email: googleUser.email,
+            username,
+            provider: 'google',
+            providerId: googleUser.providerId,
+            isEmailVerified: true,
+          },
+        });
+
+        this.rabbitClient.emit('user.registered', {
+          userId: user.id,
+          email: user.email,
+          username: user.username,
+        });
+      }
+    }
+    return this.issueTokens(user.id, user.email);
+  }
+
+  private async generateUniqueUsername(base: string): Promise<string> {
+    const cleanBase = base.replace(/\s+/g, '').toLowerCase().slice(0, 20);
+    let username = cleanBase;
+    let attempt = 0;
+
+    while (await this.prisma.user.findUnique({ where: { username } })) {
+      attempt++;
+      username = `${cleanBase}${attempt}`;
+    }
+
+    return username;
   }
 
   async resendVerificationEmail(email: string) {
@@ -284,9 +348,16 @@ export class AuthService {
       throw new UnauthorizedException('Пользователь не найден');
     }
 
-    const isSamePassword = await bcrypt.compare(newPassword, user.passwordHash);
-    if (isSamePassword) {
-      throw new ConflictException('Новый пароль не должен совпадать со старым');
+    if (user.passwordHash) {
+      const isSamePassword = await bcrypt.compare(
+        newPassword,
+        user.passwordHash,
+      );
+      if (isSamePassword) {
+        throw new ConflictException(
+          'Новый пароль не должен совпадать со старым',
+        );
+      }
     }
 
     const passwordHash = await bcrypt.hash(newPassword, 10);
@@ -296,7 +367,7 @@ export class AuthService {
       data: { passwordHash },
     });
     await this.prisma.refreshToken.deleteMany({ where: { userId: user.id } });
-    await this.redisService.client.del(key); // одноразовость — сразу удаляем после использования
+    await this.redisService.client.del(key);
 
     return { success: true };
   }
@@ -309,6 +380,11 @@ export class AuthService {
     const user = await this.prisma.user.findUnique({ where: { id: userId } });
     if (!user) {
       throw new UnauthorizedException('Пользователь не найден');
+    }
+    if (!user.passwordHash) {
+      throw new BadRequestException(
+        'У этого аккаунта ещё нет пароля (вход через Google) — используйте восстановление пароля, чтобы задать его',
+      );
     }
 
     const isCurrentPasswordValid = await bcrypt.compare(

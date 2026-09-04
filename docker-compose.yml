@@ -38,9 +38,13 @@ services:
     networks:
       - chat-alpha-network
 
+name: chat-alpha-auth
+
 volumes:
   pgdata:
+    name: chat-alpha-00001_pgdata
   redisdata:
+    name: chat-alpha-00001_redisdata
 
 networks:
   chat-alpha-network:

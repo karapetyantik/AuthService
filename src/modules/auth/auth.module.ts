@@ -4,11 +4,12 @@ import { ConfigService } from '@nestjs/config';
 import type { StringValue } from 'ms';
 import { AuthService } from './auth.service';
 import { AuthController } from './auth.controller';
-import { PrismaModule } from '../prisma/prisma.module';
-import { EmailModule } from 'src/email/email.module';
-import { RedisModule } from 'src/redis/redis.module';
+import { PrismaModule } from '../../common/prisma/prisma.module';
+import { EmailModule } from 'src/modules/email/email.module';
+import { RedisModule } from 'src/common/redis/redis.module';
 import { JwtStrategy } from './jwt/jwt.strategy';
 import { ClientsModule, Transport } from '@nestjs/microservices';
+import { GoogleStrategy } from './oauth/google.strategy';
 
 @Module({
   imports: [
@@ -36,12 +37,12 @@ import { ClientsModule, Transport } from '@nestjs/microservices';
         signOptions: {
           expiresIn:
             config.get<StringValue>('JWT_ACCESS_EXPIRES_IN') ??
-            ('1d' as StringValue),
+            ('30m' as StringValue),
         },
       }),
     }),
   ],
-  providers: [AuthService, JwtStrategy],
+  providers: [AuthService, JwtStrategy, GoogleStrategy],
   controllers: [AuthController],
 })
 export class AuthModule {}

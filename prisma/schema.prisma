@@ -7,17 +7,19 @@ datasource db {
 }
 
 model User {
-  id                         String         @id @default(uuid())
-  email                      String         @unique
-  passwordHash               String
-  username                   String         @unique
-  avatarUrl                  String?
-  isEmailVerified            Boolean        @default(false)
-  createdAt                  DateTime       @default(now())
-  updatedAt                  DateTime       @updatedAt
-  refreshTokens              RefreshToken[] 
-  totpSecret                 String?        
-  isTotpEnabled              Boolean        @default(false)
+  id              String         @id @default(uuid())
+  email           String         @unique
+  passwordHash    String?
+  username        String         @unique
+  avatarUrl       String?
+  isEmailVerified Boolean        @default(false)
+  provider        String?
+  providerId      String?        @unique
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+  refreshTokens   RefreshToken[]
+  totpSecret      String?
+  isTotpEnabled   Boolean        @default(false)
 }
 
 model RefreshToken {
