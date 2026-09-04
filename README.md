@@ -1,330 +1,218 @@
-# AuthService — документация
+# AuthService — подробная документация (все файлы)
 
-Сервис аутентификации и авторизации пользователей на базе NestJS. Инкапсулирует всю бизнес-логику работы с учётными записями: регистрацию, вход (включая двухфакторную аутентификацию по TOTP), подтверждение email, восстановление и смену пароля, а также управление refresh-токенами.
+Микросервис аутентификации и авторизации. Хранилище — PostgreSQL через Prisma. Отвечает за регистрацию/вход по паролю, вход через Google OAuth2, двухфакторную аутентификацию (TOTP), подтверждение email, восстановление и смену пароля, ротацию refresh-токенов и публикацию события `user.registered` для других сервисов.
 
 ---
 
-## 1. Общее описание
+## 1. Дерево модуля
 
-`AuthService` — `@Injectable()`-сервис, который используется контроллером `AuthController` для обработки HTTP-запросов, связанных с аутентификацией.
+```
+src/
+├── main.ts
+├── app.module.ts / app.controller.ts / app.service.ts
+├── common/
+│   ├── prisma/ (prisma.module.ts, prisma.service.ts)
+│   └── redis/  (redis.module.ts, redis.service.ts)
+└── modules/
+    ├── auth/
+    │   ├── auth.module.ts
+    │   ├── auth.controller.ts
+    │   ├── auth.service.ts
+    │   ├── dto/ (register, login, refresh, forgot-password, reset-password,
+    │   │         change-password, totp, totp-login, verify-email-code,
+    │   │         resend-verification)
+    │   ├── jwt/ (jwt-auth.guard.ts, jwt.strategy.ts)
+    │   └── oauth/ (google.strategy.ts)
+    └── email/
+        ├── email.module.ts
+        └── email.service.ts
+```
 
-Сервис отвечает за:
+---
 
-- регистрацию новых пользователей и рассылку писем подтверждения email;
-- вход по паролю с опциональным вторым фактором (TOTP);
-- выпуск и обновление пары `accessToken` / `refreshToken`;
-- подтверждение email по коду или по токену-ссылке;
-- восстановление пароля по email (forgot/reset) и смену пароля авторизованным пользователем;
-- включение/отключение двухфакторной аутентификации (TOTP);
-- защиту от брутфорса через счётчики попыток в Redis.
+## 2. `main.ts` — точка входа
 
-### 1.1. Зависимости (внедряются через конструктор)
+- Создаёт приложение Nest, подключает глобальный `ValidationPipe({ whitelist: true, forbidNonWhitelisted: true })` — лишние поля в теле запроса отклоняются на уровне валидации.
+- Слушает HTTP-порт из `PORT` (по умолчанию `3000`).
+- Никаких микросервисных транспортов (RabbitMQ-consumer, gRPC) не поднимает — сервис **только publisher** событий (см. ниже), не подписчик.
 
-| Зависимость | Назначение |
+## 3. `app.module.ts`
+
+- Подключает `ConfigModule.forRoot({ isGlobal: true })`.
+- Регистрирует `ThrottlerModule.forRoot([{ ttl: 60, limit: 20, blockDuration: 1800 }])` — глобальный rate-limit: 20 запросов/60 сек на IP по умолчанию, блокировка нарушителя на 30 минут (`blockDuration = 3600/2`).
+- Подключает `PrismaModule`, `AuthModule`, `EmailModule`, `RedisModule`.
+- Регистрирует `ThrottlerGuard` как глобальный `APP_GUARD` — throttling применяется ко **всем** эндпоинтам приложения, а не только к тем, где явно указан `@Throttle(...)` (последний лишь переопределяет лимит для конкретного роута, например `login`/`refresh` — 5/мин вместо общих 20/мин).
+
+## 4. `common/prisma/` — `PrismaService`, `PrismaModule`
+
+- `PrismaService` расширяет `PrismaClient`, использует `PrismaPg`-адаптер (`@prisma/adapter-pg`) с `connectionString` из `DATABASE_URL`.
+- Подключается в `onModuleInit` (`$connect()`), отключается в `onModuleDestroy` (`$disconnect()`).
+- Глобально экспортируется через `PrismaModule`.
+
+## 5. `common/redis/` — `RedisService`, `RedisModule`
+
+- Оборачивает клиент `ioredis` (`ioredis/built/Redis`), подключается по `REDIS_HOST`/`REDIS_PORT` (по умолчанию `localhost:6379`).
+- `client` — публичное свойство, используется напрямую другими сервисами (не инкапсулирует конкретные операции — «сырой» доступ к Redis).
+
+## 6. `modules/email/` — `EmailService`, `EmailModule`
+
+- `EmailService.onModuleInit()` создаёт **тестовый** SMTP-аккаунт через `nodemailer.createTestAccount()` (сервис [Ethereal Email](https://ethereal.email)) и логирует его в консоль — то есть **реальные письма никуда не долетают**, это dev/staging-заглушка. В продакшене этот код потребует замены на реальный SMTP/провайдера транзакционных писем.
+- `sendVerificationEmail(to, code, token)` — отправляет письмо с 6-значным кодом и ссылкой вида `http://localhost:3000/auth/verify-email/{token}` (URL захардкожен, не берётся из конфигурации).
+- `sendPasswordResetEmail(to, token)` — аналогично, ссылка `http://localhost:3000/auth/reset-password/{token}` (обратите внимание: этот путь ведёт на **фронтенд**, а не на API, что логично для UX сброса пароля, но не совпадает по формату с `verify-email`, где ссылка ведёт напрямую в API — см. замечания).
+- После отправки логирует `nodemailer.getTestMessageUrl(info)` — ссылку для предпросмотра письма в Ethereal (только для разработки).
+
+## 7. `modules/auth/dto/*` — валидация запросов
+
+| DTO | Поля и правила |
 |---|---|
-| `PrismaService` | Доступ к БД (модели `user`, `refreshToken`) |
-| `JwtService` (`@nestjs/jwt`) | Подпись и верификация JWT (access-токены, временные токены) |
-| `ConfigService` | Чтение конфигурации (`JWT_REFRESH_EXPIRES_IN` и т.д.) |
-| `EmailService` | Отправка писем (подтверждение регистрации, сброс пароля) |
-| `RedisService` | Хранение временных данных: коды подтверждения, счётчики попыток, блокировки, TOTP-anti-replay |
-| `ClientProxy` (`RABBITMQ_SERVICE`) | Публикация события `user.registered` в очередь RabbitMQ |
+| `RegisterDto` | `email` (валидный email), `username` (строка 3–32 символа), `password` (строка, минимум 8 символов) |
+| `LoginDto` | `email` (email), `password` (строка) |
+| `RefreshDto` | `refreshToken` (строка) |
+| `ForgotPasswordDto` | `email` (email) |
+| `ResetPasswordDto` | `token` (строка), `newPassword` (строка, минимум 8) |
+| `ChangePasswordDto` | `currentPassword` (строка), `newPassword` (строка, минимум 8) |
+| `TotpCodeDto` | `code` — строка, регулярное выражение `^\d{6}$` (ровно 6 цифр) |
+| `TotpLoginDto` | `tempToken` (строка), `code` (6 цифр, та же маска) |
+| `VerifyEmailCodeDto` | `email` (email), `code` (6 цифр) |
+| `ResendVerificationDto` | `email` (email) |
 
-### 1.2. Используемые библиотеки
+Замечание: в `reset-password.dto.ts` среди импортов присутствует неиспользуемая `isString` (функция, а не декоратор, с маленькой буквы) — вероятно, случайный лишний импорт, не влияющий на работу, но указывающий на неаккуратность кода (линтер должен был это отловить).
 
-- `bcrypt` — хеширование паролей;
-- `crypto` (`randomBytes`, `createHash`) — генерация случайных токенов и их хеширование (SHA-256);
-- `ms` — парсинг строк длительности (`"15d"` → миллисекунды);
-- `otplib` (`generateSecret`, `generateURI`, `verify`) — генерация и проверка TOTP-кодов;
-- `qrcode` — генерация QR-кода для подключения приложения-аутентификатора.
+## 8. `modules/auth/jwt/` — JWT-стратегия и guard
 
----
+- **`JwtStrategy`** (`passport-jwt`): извлекает токен из заголовка `Authorization: Bearer ...`, не игнорирует истечение срока действия (`ignoreExpiration: false`), секрет — `JWT_SECRET` (обязателен, `getOrThrow`). `validate(payload)` возвращает `{ userId: payload.sub, email: payload.email }`, что попадает в `req.user`.
+- **`JwtAuthGuard`** — тонкая обёртка `AuthGuard('jwt')`, используется декоратором `@UseGuards(JwtAuthGuard)` на защищённых роутах.
 
-## 2. Публичные методы
+## 9. `modules/auth/oauth/google.strategy.ts` — вход через Google
 
-### 2.1. `register(dto: RegisterDto): Promise<SafeUser>`
+- `GoogleStrategy` (`passport-google-oauth20`), регистрируется под именем `'google'`.
+- Конфигурация — `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_CALLBACK_URL` (все обязательны через `getOrThrow`), запрашиваемые scope — `['email', 'profile']`.
+- `validate(accessToken, refreshToken, profile, done)` — не сохраняет `accessToken`/`refreshToken` Google (они просто не используются далее), извлекает из профиля `id` (→ `providerId`), первый email из `emails[0].value`, `displayName`, передаёт объект `{ providerId, email, displayName }` в `done()` — это то, что окажется в `req.user` внутри `googleAuthCallback`.
 
-Регистрирует нового пользователя.
+## 10. `modules/auth/auth.module.ts`
 
-**Логика:**
-1. Проверяет, что пользователь с таким `email` или `username` ещё не существует — иначе `ConflictException`.
-2. Хеширует пароль (`bcrypt`, salt rounds = 10).
-3. Создаёт пользователя в БД.
-4. Отправляет письмо с кодом/токеном подтверждения email (`sendVerificationEmail`).
-5. Публикует событие `user.registered` в RabbitMQ с полями `userId`, `email`, `username`.
-6. Возвращает пользователя без поля `passwordHash`.
+- Импортирует `PrismaModule`, `EmailModule`, `RedisModule`.
+- Регистрирует `ClientsModule` с транспортом `RMQ` под именем `RABBITMQ_SERVICE`: очередь `user_events` (durable), URL — `RABBITMQ_URL`. Это **исходящий** канал — `AuthService` публикует сюда `user.registered`.
+- Регистрирует `JwtModule.registerAsync`: секрет — `JWT_SECRET`, время жизни access-токена по умолчанию `expiresIn` из `JWT_ACCESS_EXPIRES_IN`, иначе `'30m'`.
+- Providers: `AuthService`, `JwtStrategy`, `GoogleStrategy`. Controllers: `AuthController`.
 
-**Исключения:**
-- `ConflictException` — email или username уже заняты.
+## 11. `modules/auth/auth.controller.ts` — REST API (`/auth/*`)
 
-**Побочные эффекты:** запись в БД, письмо, сообщение в очередь.
-
----
-
-### 2.2. `login(dto: LoginDto): Promise<{ accessToken, refreshToken } | { requiresTotp: true, tempToken }>`
-
-Аутентифицирует пользователя по email и паролю.
-
-**Логика:**
-1. Ищет пользователя по `email`. Если не найден — `UnauthorizedException('Invalid email or password')`.
-2. Проверка email verified закомментирована (см. раздел «Замечания», п. 6.1).
-3. Сравнивает пароль через `bcrypt.compare`. Если неверный — та же ошибка `Invalid email or password` (намеренно не раскрывается, что именно неверно — email или пароль).
-4. Если у пользователя включена TOTP (`isTotpEnabled`):
-   - выпускает **временный** JWT (`purpose: 'totp-login'`) со сроком жизни 5 минут;
-   - возвращает `{ requiresTotp: true, tempToken }`, не выдавая полноценные токены.
-5. Если TOTP выключена — сразу вызывает `issueTokens` и возвращает пару токенов.
-
-**Исключения:**
-- `UnauthorizedException` — неверные email/пароль.
-
----
-
-### 2.3. `verifyTotpLogin(tempToken: string, code: string): Promise<{ accessToken, refreshToken }>`
-
-Второй шаг входа при включённой 2FA — подтверждение временного токена TOTP-кодом.
-
-**Логика:**
-1. Верифицирует `tempToken` (`jwtService.verifyAsync`). Ошибка подписи/срока → `UnauthorizedException` («сессия входа истекла»).
-2. Проверяет `payload.purpose === 'totp-login'`, иначе — «неверный тип токена» (защита от подмены токена другого назначения).
-3. Проверяет блокировку по ключу Redis `totp_blocked:{userId}` — если пользователь заблокирован после серии неверных попыток, вход запрещён.
-4. Загружает пользователя, проверяет, что 2FA включена и `totpSecret` установлен.
-5. Вызывает `verifyTotpCode`. Если код неверный:
-   - инкрементирует счётчик `totp_attempts:{userId}` (TTL 15 минут при первой попытке);
-   - при достижении 5 неудачных попыток — устанавливает блокировку `totp_blocked:{userId}` на 24 часа и сбрасывает счётчик;
-   - иначе — `UnauthorizedException('Неверный код')`.
-6. При успехе — сбрасывает счётчик попыток и выпускает токены через `issueTokens`.
-
-**Исключения:**
-- `UnauthorizedException` — истёкший/невалидный токен, неверный тип токена, блокировка, 2FA не включена, неверный код.
-
-**Защита от брутфорса:** лимит 5 попыток / 15 минут → блокировка на 24 часа.
-
----
-
-### 2.4. `resendVerificationEmail(email: string): Promise<{ success: true }>`
-
-Повторно отправляет письмо подтверждения email.
-
-**Логика:**
-- Если пользователь не найден — возвращает `{ success: true }` **без ошибки** (защита от энумерации email-адресов).
-- Если email уже подтверждён — `ConflictException`.
-- Иначе — отправляет письмо заново.
-
----
-
-### 2.5. `verifyEmailByCode(email: string, code: string): Promise<{ success, alreadyVerified? }>`
-
-Подтверждение email коротким кодом (например, из письма).
-
-**Логика:**
-1. Если email уже подтверждён — сразу `{ success: true, alreadyVerified: true }`.
-2. Сравнивает переданный `code` с кодом, хранящимся в Redis (`email_verification_code:{email}`, TTL 15 минут).
-3. При несовпадении (или отсутствии пользователя) — инкрементирует `email_verification_attempts:{email}` (TTL 15 минут), при превышении 5 попыток — блокирует на 15 минут ошибкой `UnauthorizedException`.
-4. При совпадении — удаляет счётчик попыток и код из Redis, помечает email подтверждённым.
-
-**Исключения:**
-- `UnauthorizedException` — неверный код или превышен лимит попыток.
-
----
-
-### 2.6. `verifyEmailByToken(token: string): Promise<{ success, alreadyVerified? }>`
-
-Подтверждение email по ссылке из письма (JWT-токен).
-
-**Логика:**
-1. Верифицирует JWT; ошибка → `UnauthorizedException` («ссылка недействительна или истекла»).
-2. Проверяет `payload.purpose === 'verify-email'`.
-3. Проверяет существование пользователя и текущий статус подтверждения.
-4. Помечает email подтверждённым (`markEmailVerified`).
-
----
-
-### 2.7. `forgotPassword(email: string): Promise<{ success: true }>`
-
-Инициирует процесс восстановления пароля.
-
-**Логика:**
-1. Если пользователь не найден — возвращает `{ success: true }` (защита от энумерации email).
-2. Инкрементирует `password_reset_attempts:{email}` (TTL 1 час); если запросов больше 3 за час — тихо возвращает успех, письмо не отправляется (rate-limit).
-3. Генерирует случайный `resetToken` (32 байта → 64 hex-символа), сохраняет в Redis (`password_reset_token:{token}` → `email`, TTL 1 час).
-4. Отправляет письмо со ссылкой сброса пароля.
-
-**Важно:** метод **всегда** возвращает `{ success: true }`, независимо от того, существует ли пользователь — это стандартная практика против email enumeration.
-
----
-
-### 2.8. `resetPassword(token: string, newPassword: string): Promise<{ success: true }>`
-
-Завершает восстановление пароля по токену из письма.
-
-**Логика:**
-1. Получает `email` по `resetToken` из Redis. Нет записи → `UnauthorizedException` (токен недействителен/истёк).
-2. Находит пользователя по email.
-3. Проверяет, что новый пароль **не совпадает** с текущим (`bcrypt.compare`) — иначе `ConflictException`.
-4. Хеширует и сохраняет новый пароль.
-5. Удаляет **все** refresh-токены пользователя (принудительный разлогин на всех устройствах).
-6. Удаляет использованный `resetToken` из Redis (одноразовость).
-
----
-
-### 2.9. `changePassword(userId, currentPassword, newPassword): Promise<{ success: true }>`
-
-Смена пароля авторизованным пользователем (требует `JwtAuthGuard` на уровне контроллера).
-
-**Логика:**
-1. Проверяет текущий пароль — иначе `UnauthorizedException`.
-2. Проверяет, что новый пароль отличается от старого — иначе `ConflictException`.
-3. Обновляет `passwordHash`.
-4. Удаляет все refresh-токены пользователя (разлогин на всех устройствах).
-
----
-
-### 2.10. `refresh(refreshToken: string): Promise<{ accessToken, refreshToken }>`
-
-Обновляет пару токенов по refresh-токену (реализует **ротацию** refresh-токенов).
-
-**Логика:**
-1. Хеширует переданный refresh-токен (SHA-256) и ищет его в БД вместе с пользователем.
-2. Если запись не найдена или срок истёк — `UnauthorizedException`.
-3. Удаляет использованный refresh-токен (одноразовость / ротация).
-4. Выпускает новую пару токенов через `issueTokens`.
-
-**Замечание:** т.к. в БД хранится сразу хеш, сам refresh-токен нигде не сохраняется в открытом виде — компрометация БД не даёт возможности им воспользоваться.
-
----
-
-### 2.11. `logout(refreshToken: string): Promise<{ success: true }>`
-
-Инвалидирует refresh-токен (удаляет из БД по хешу). Не выбрасывает ошибку, если токен не найден — операция идемпотентна.
-
----
-
-### 2.12. `generateTotpSecret(userId: string): Promise<{ qrCodeDataUrl, secret }>`
-
-Первый шаг подключения 2FA.
-
-**Логика:**
-1. Проверяет существование пользователя и что 2FA ещё не включена (`ConflictException`, если уже включена).
-2. Генерирует TOTP-секрет (`otplib.generateSecret`), сохраняет его в БД (`totpSecret`) — **до подтверждения кодом**, то есть секрет уже персистентен, но `isTotpEnabled` остаётся `false`.
-3. Формирует `otpauth://` URI (issuer `ChatApp`, label — email пользователя) и кодирует его в QR-код (data URL).
-
-**Возвращает:** объект для отображения пользователю (QR-код + текстовый секрет для ручного ввода).
-
----
-
-### 2.13. `enableTotp(userId: string, code: string): Promise<{ success: true }>`
-
-Подтверждает и активирует 2FA.
-
-**Логика:**
-1. Проверяет, что секрет сгенерирован ранее и 2FA ещё не включена.
-2. Проверяет код через `verifyTotpCode`.
-3. Устанавливает `isTotpEnabled = true`.
-
----
-
-### 2.14. `disableTotp(userId: string, code: string): Promise<{ success: true }>`
-
-Отключает 2FA (требует подтверждения текущим TOTP-кодом).
-
-**Логика:**
-1. Проверяет, что 2FA включена и секрет существует.
-2. Проверяет код.
-3. Очищает `isTotpEnabled` и `totpSecret`.
-
----
-
-## 3. Приватные вспомогательные методы
-
-### 3.1. `sendVerificationEmail(email: string): Promise<void>`
-
-- Генерирует 6-значный числовой код (`100000`–`999999`).
-- Сохраняет в Redis: `email_verification_code:{email}`, TTL 15 минут.
-- Параллельно формирует JWT-токен (`purpose: 'verify-email'`, TTL 15 минут) для ссылки в письме.
-- Отправляет письмо через `EmailService`, передавая **и код, и токен** — пользователь может подтвердить email либо переходом по ссылке, либо вводом кода вручную.
-
-### 3.2. `markEmailVerified(userId: string): Promise<{ success: true }>`
-
-Устанавливает `isEmailVerified = true` в БД.
-
-### 3.3. `issueTokens(userId: string, email: string): Promise<{ accessToken, refreshToken }>`
-
-Централизованная точка выпуска токенов.
-
-- `accessToken` — подписанный JWT с payload `{ sub: userId, email }`. Срок жизни берётся из настроек `JwtModule` (в самом методе явно не переопределяется).
-- `refreshToken` — случайные 40 байт (`randomBytes(40).toString('hex')`, 80 hex-символов), **не JWT**, а непрозрачный токен.
-- В БД сохраняется **не сам токен**, а его SHA-256-хеш (`hashToken`) вместе с `userId` и `expiresAt`.
-- Срок жизни refresh-токена берётся из `ConfigService` (`JWT_REFRESH_EXPIRES_IN`), по умолчанию `15d`, парсится библиотекой `ms`.
-
-### 3.4. `hashToken(token: string): string`
-
-Возвращает SHA-256-хеш строки в hex — используется для refresh-токенов, чтобы не хранить их в БД в открытом виде.
-
-### 3.5. `verifyTotpCode(userId, secret, token): Promise<boolean>`
-
-Проверка TOTP-кода с защитой от повторного использования (anti-replay):
-
-1. Проверяет код через `otplib.verify` (учитывает стандартное окно допуска `delta`).
-2. Если код невалиден — `false`.
-3. Вычисляет номер текущего 30-секундного «шага» TOTP и, с учётом `delta`, номер шага, которому соответствует введённый код (`usedStep`).
-4. Сравнивает с последним использованным шагом, сохранённым в Redis (`totp_last_step:{userId}`). Если `usedStep` уже был использован или меньше/равен последнему — код отклоняется (`false`), даже если он математически верный. Это предотвращает повторное использование перехваченного кода в течение окна действия.
-5. При успехе сохраняет `usedStep` в Redis с TTL 5 минут.
-
----
-
-## 4. Используемые ключи Redis
-
-| Ключ | Назначение | TTL |
-|---|---|---|
-| `email_verification_code:{email}` | Код подтверждения email | 15 мин |
-| `email_verification_attempts:{email}` | Счётчик неудачных попыток подтверждения email | 15 мин |
-| `password_reset_token:{token}` | Связь одноразового токена сброса пароля с email | 1 час |
-| `password_reset_attempts:{email}` | Счётчик запросов сброса пароля (rate limit) | 1 час |
-| `totp_attempts:{userId}` | Счётчик неверных TOTP-кодов при логине | 15 мин |
-| `totp_blocked:{userId}` | Флаг блокировки входа после превышения попыток TOTP | 24 часа |
-| `totp_last_step:{userId}` | Anti-replay: последний использованный шаг TOTP | 5 мин |
-
----
-
-## 5. Модель токенов
-
-| Токен | Формат | Хранение | Срок жизни | Назначение |
+| Метод | HTTP | Роут | Guard/Throttle | Делегирует |
 |---|---|---|---|---|
-| Access token | JWT (`sub`, `email`) | не хранится на сервере | из конфигурации `JwtModule` | авторизация запросов |
-| Refresh token | случайные 40 байт (hex) | в БД хранится SHA-256-хеш | `JWT_REFRESH_EXPIRES_IN` (по умолчанию 15d) | обновление access-токена, ротируется при каждом использовании |
-| Temp TOTP token | JWT (`sub`, `email`, `purpose: 'totp-login'`) | не хранится | 5 мин | промежуточный шаг логина при включённой 2FA |
-| Email verify token | JWT (`email`, `purpose: 'verify-email'`) | не хранится | 15 мин | подтверждение email по ссылке |
+| `googleAuth` | GET | `/auth/google` | `AuthGuard('google')` | — (инициирует OAuth-редирект на Google) |
+| `googleAuthCallback` | GET | `/auth/google/callback` | `AuthGuard('google')` | `authService.oauthLogin(req.user)`, затем **редирект** на фронтенд |
+| `getProfile` | GET | `/auth/profile` | `JwtAuthGuard` | возвращает `req.user` как есть |
+| `register` | POST | `/auth/register` | — | `authService.register(dto)` |
+| `login` | POST | `/auth/login` | `@Throttle` 5/мин | `authService.login(dto)` |
+| `refresh` | POST | `/auth/refresh` | `@Throttle` 5/мин | `authService.refresh(dto.refreshToken)` |
+| `forgotPassword` | POST | `/auth/forgot-password` | — | `authService.forgotPassword(dto.email)` |
+| `resetPassword` | POST | `/auth/reset-password` | — | `authService.resetPassword(dto.token, dto.newPassword)` |
+| `changePassword` | POST | `/auth/change-password` | `JwtAuthGuard` | `authService.changePassword(userId, current, new)` |
+| `logout` | POST | `/auth/logout` | — | `authService.logout(dto.refreshToken)` |
+| `verifyEmailByCode` | POST | `/auth/verify-email` | — | `authService.verifyEmailByCode(email, code)` |
+| `verifyEmailByToken` | GET | `/auth/verify-email/:token` | — | `authService.verifyEmailByToken(token)` |
+| `resendVerification` | POST | `/auth/resend-verification` | — | `authService.resendVerificationEmail(email)` |
+| `generateTotpSecret` | POST | `/auth/totp/generate` | `JwtAuthGuard` | `authService.generateTotpSecret(userId)` |
+| `enableTotp` | POST | `/auth/totp/enable` | `JwtAuthGuard` | `authService.enableTotp(userId, code)` |
+| `disableTotp` | POST | `/auth/totp/disable` | `JwtAuthGuard` | `authService.disableTotp(userId, code)` |
+| `verifyTotpLogin` | POST | `/auth/totp/login` | — | `authService.verifyTotpLogin(tempToken, code)` |
+
+**Google OAuth flow:**
+1. Клиент открывает `GET /auth/google` → Passport-стратегия перенаправляет на страницу согласия Google.
+2. После согласия Google вызывает `GET /auth/google/callback` → guard прогоняет ответ через `GoogleStrategy.validate`, кладёт `{ providerId, email, displayName }` в `req.user`.
+3. Контроллер вызывает `authService.oauthLogin(req.user)`, получает `{ accessToken, refreshToken }`.
+4. Контроллер делает `res.redirect` на `${FRONTEND_URL}/oauth/callback?accessToken=...&refreshToken=...` — токены передаются во **фронтенд через query-параметры URL** (см. замечания — это потенциально небезопасно: попадает в историю браузера, логи сервера, `Referer`-заголовки).
+
+## 12. `modules/auth/auth.service.ts` — бизнес-логика
+
+### Зависимости
+`PrismaService`, `JwtService`, `ConfigService`, `EmailService`, `RedisService`, `ClientProxy('RABBITMQ_SERVICE')`.
+
+### 12.1. `register(dto)`
+Как в базовой версии: проверка дубликата email/username → `bcrypt.hash` (10 rounds) → создание пользователя → письмо подтверждения → `rabbitClient.emit('user.registered', { userId, email, username })` → возврат пользователя без `passwordHash`.
+
+### 12.2. `login(dto)`
+Отличие от предыдущей версии: теперь учитывает пользователей, зарегистрированных через Google (`passwordHash` может быть `null`).
+- Если пользователь не найден **или** `passwordHash` отсутствует — `UnauthorizedException` с разным текстом: `'Этот аккаунт использует вход через Google'` (если юзер есть, но без пароля) или `'Неверный email или пароль'` (если юзера нет). **Замечание:** это раскрывает существование аккаунта — то есть здесь (в отличие от `forgotPassword`) сообщение всё же различается в зависимости от того, найден пользователь или нет, что является небольшой информационной утечкой (email enumeration через различие сообщений «неверный email или пароль» vs «этот аккаунт использует вход через Google»).
+- Далее — как раньше: `bcrypt.compare`, при включённой TOTP — временный токен, иначе — `issueTokens`.
+
+### 12.3. `verifyTotpLogin(tempToken, code)`
+Без изменений относительно ранее задокументированной версии: проверка временного токена, блокировка после 5 неверных попыток на 24 часа, anti-replay через `verifyTotpCode`.
+
+### 12.4. `oauthLogin(googleUser)` — новый метод
+1. Ищет пользователя по `providerId`.
+2. Если не найден — ищет по `email`:
+   - **если найден по email** — «привязывает» Google к существующему аккаунту: обновляет `provider: 'google'`, `providerId`, `isEmailVerified: true` (email через Google считается автоматически подтверждённым). Событие `user.registered` **не** публикуется повторно (пользователь уже существовал).
+   - **если не найден вовсе** — генерирует уникальный `username` (`generateUniqueUsername`) на основе `displayName`, создаёт нового пользователя с `provider: 'google'`, `providerId`, `isEmailVerified: true`, публикует `user.registered`.
+3. В обоих случаях (найден по `providerId` сразу, привязан по email, или создан заново) — выпускает токены (`issueTokens`).
+
+**Замечание (безопасность):** автоматическая привязка Google-аккаунта к существующему пользователю **только по совпадению email**, без дополнительного подтверждения владения этим email через пароль или иной фактор, — потенциальный вектор атаки, если Google когда-либо вернёт непроверенный (`email_verified: false`) email для стороннего провайдера (для самого Google это маловероятно, но в целом такой паттерн привязки без доп. проверки считается рискованным).
+
+### 12.5. `generateUniqueUsername(base)` — приватный метод
+- Приводит `displayName` к нижнему регистру, убирает пробелы, обрезает до 20 символов.
+- В цикле проверяет занятость через `findUnique({ where: { username } })`, при коллизии добавляет числовой суффикс (`name1`, `name2`, ...). Потенциально медленно при большом числе коллизий (последовательные запросы к БД в цикле), но для обычного распределения имён не критично.
+
+### 12.6. `resendVerificationEmail`, `sendVerificationEmail`, `verifyEmailByCode`, `verifyEmailByToken`, `markEmailVerified`, `forgotPassword`
+Идентичны ранее задокументированной версии (см. документацию первой версии `AuthService`): защита от email enumeration, коды/токены с TTL 15 минут, лимит попыток, rate-limit на `forgotPassword` (максимум 3 запроса в час на email).
+
+### 12.7. `resetPassword(token, newPassword)` — изменение относительно базовой версии
+Теперь проверка «пароль не должен совпадать со старым» выполняется **только если** у пользователя уже есть `passwordHash` (`if (user.passwordHash) { ... }`) — иначе (пользователь пришёл через Google и ещё не задавал пароль) проверка пропускается, так как сравнивать не с чем. Это, по сути, механизм **задать первый пароль** Google-пользователю через флоу восстановления пароля.
+
+### 12.8. `changePassword(userId, currentPassword, newPassword)` — изменение
+Теперь явно проверяет, что у пользователя есть `passwordHash`, прежде чем сравнивать текущий пароль: если пароля ещё нет (чистый Google-аккаунт) — `BadRequestException('У этого аккаунта ещё нет пароля (вход через Google) — используйте восстановление пароля, чтобы задать его')`. Логичное и явное сообщение, направляющее пользователя к `forgotPassword`/`resetPassword` как способу «завести» пароль.
+
+### 12.9. `refresh`, `logout`, `issueTokens`, `hashToken`
+Без изменений — SHA-256-хеш refresh-токена хранится в БД, сам токен — нет; ротация при каждом `refresh` (старый удаляется, выдаётся новый).
+
+### 12.10. `generateTotpSecret`, `enableTotp`, `disableTotp`, `verifyTotpCode`
+Без изменений относительно базовой версии — генерация секрета и QR (issuer `ChatApp`), anti-replay через Redis (`totp_last_step:{userId}`, TTL 5 мин).
 
 ---
 
-## 6. Замечания и потенциальные риски
+## 13. Модель данных (реконструкция по Prisma-запросам)
 
-Эти пункты стоит держать в поле зрения при дальнейшей доработке — они не являются багами документации, а фиксируют текущее поведение кода «как есть».
+Схема `.prisma` не входит в переданные файлы; ниже — поля, использованные в коде.
 
-1. **Проверка `isEmailVerified` при логине закомментирована.** Сейчас пользователь может войти в систему, даже не подтвердив email. Если это не задумано как временная мера — стоит раскомментировать блок в `login()`.
-2. **`generateTotpSecret` сохраняет секрет в БД до подтверждения кодом.** Если пользователь сгенерировал секрет, но не завершил включение 2FA (`enableTotp`), секрет остаётся висеть в БД. Это не критично (2FA всё ещё выключена), но стоит учитывать при повторных вызовах — метод просто перезапишет старый секрет новым.
-3. **Различие в обработке несуществующего пользователя.** `forgotPassword` и `resendVerificationEmail` намеренно не раскрывают, существует ли email (возвращают `success: true`), тогда как `login` тоже не раскрывает разницу между «нет пользователя» и «неверный пароль» — это единообразное и правильное поведение против enumeration-атак.
-4. **`resetPassword`/`changePassword` инвалидируют все refresh-токены пользователя** — корректное поведение безопасности (разлогин на всех устройствах при смене пароля).
-5. **Сообщения об ошибках на русском языке** зашиты прямо в сервисе (не вынесены в i18n-слой) — стоит учитывать при мультиязычности фронтенда.
-6. **Rate limiting на уровне контроллера** (`@Throttle`) применён только к `login` и `refresh`; логика в самом сервисе (Redis-счётчики) покрывает дополнительно TOTP, подтверждение email и сброс пароля, но, например, `register` не имеет собственной защиты от брутфорса на уровне сервиса — полагается только на глобальный throttler, если он подключён.
+**`User`**
+| Поле | Тип (предположительно) | Комментарий |
+|---|---|---|
+| `id` | string (PK) | |
+| `email` | string, unique | |
+| `username` | string, unique | |
+| `passwordHash` | string \| null | `null` для чисто OAuth-аккаунтов |
+| `provider` | string \| null | например `'google'` |
+| `providerId` | string \| null, unique | ID пользователя у внешнего провайдера |
+| `isEmailVerified` | boolean | автоматически `true` при входе через Google |
+| `isTotpEnabled` | boolean | |
+| `totpSecret` | string \| null | |
+
+**`RefreshToken`**
+| Поле | Комментарий |
+|---|---|
+| `id` | PK |
+| `tokenHash` | unique, SHA-256 refresh-токена |
+| `userId` | FK на `User` |
+| `expiresAt` | дата истечения |
 
 ---
 
-## 7. Связанные эндпоинты (`AuthController`)
+## 14. Публикуемые события RabbitMQ
 
-| Метод сервиса | HTTP | Роут | Guard |
+| Событие | Очередь | Когда | Payload |
 |---|---|---|---|
-| `register` | POST | `/auth/register` | — |
-| `login` | POST | `/auth/login` | Throttle 5/мин |
-| `verifyTotpLogin` | POST | `/auth/totp/login` | — |
-| `refresh` | POST | `/auth/refresh` | Throttle 5/мин |
-| `logout` | POST | `/auth/logout` | — |
-| `forgotPassword` | POST | `/auth/forgot-password` | — |
-| `resetPassword` | POST | `/auth/reset-password` | — |
-| `changePassword` | POST | `/auth/change-password` | `JwtAuthGuard` |
-| `verifyEmailByCode` | POST | `/auth/verify-email` | — |
-| `verifyEmailByToken` | GET | `/auth/verify-email/:token` | — |
-| `resendVerificationEmail` | POST | `/auth/resend-verification` | — |
-| `generateTotpSecret` | POST | `/auth/totp/generate` | `JwtAuthGuard` |
-| `enableTotp` | POST | `/auth/totp/enable` | `JwtAuthGuard` |
-| `disableTotp` | POST | `/auth/totp/disable` | `JwtAuthGuard` |
-| — (`req.user`) | GET | `/auth/profile` | `JwtAuthGuard` |
+| `user.registered` | `user_events` | `register()`, `oauthLogin()` при создании нового пользователя | `{ userId, email, username }` |
+
+`AuthService` не подписывается ни на одно событие — чистый publisher.
+
+---
+
+## 15. Сводные замечания по всему сервису
+
+1. **`EmailService` использует Ethereal (тестовый SMTP)** — до продакшена потребуется замена на реальный почтовый провайдер; сейчас письма реально никуда, кроме тестового веб-инструмента, не доходят.
+2. **URL в письмах захардкожены** (`http://localhost:3000/...`) — не читаются из конфигурации, что сломается при деплое на любой другой домен/окружение.
+3. **Токены при Google-логине передаются через query-параметры redirect-URL** — стандартный, но не самый безопасный паттерн (риск утечки через логи прокси/CDN, `Referer`, историю браузера); более безопасная альтернатива — HttpOnly-cookie или одноразовый код обмена (authorization code flow на уровне собственного бэкенда).
+4. **Автопривязка Google-аккаунта по email без дополнительного подтверждения** — см. п. 12.4.
+5. **`login()` теперь различает «нет юзера» и «юзер есть, но без пароля» в тексте ошибки** — небольшая утечка информации о существовании аккаунта (в отличие от единообразного поведения `forgotPassword`/`resendVerificationEmail`).
+6. **Неиспользуемый импорт `isString`** в `reset-password.dto.ts` — косметическая недоработка.
+7. Все остальные замечания из первичной документации `AuthService` (закомментированная проверка `isEmailVerified` при логине, русскоязычные сообщения об ошибках без i18n) остаются актуальны и в этой версии.
