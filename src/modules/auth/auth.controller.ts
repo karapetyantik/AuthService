@@ -23,6 +23,7 @@ import { TotpCodeDto } from './dto/totp.dto';
 import { TotpLoginDto } from './dto/totp-login.dto';
 import { AuthGuard } from '@nestjs/passport';
 import { ConfigService } from '@nestjs/config';
+import { Response } from 'express';
 
 @Controller('auth')
 export class AuthController {
@@ -37,7 +38,24 @@ export class AuthController {
 
   @Get('google/callback')
   @UseGuards(AuthGuard('google'))
-  async googleAuthCallback(@Req() req: any, @Res() res: any) {
+  async googleAuthCallback(@Req() req: any, @Res() res: Response) {
+    const tokens = await this.authService.oauthLogin(req.user);
+    const frontendUrl = this.configService.get<string>(
+      'FRONTEND_URL',
+      'http://localhost:5173',
+    );
+    res.redirect(
+      `${frontendUrl}/oauth/callback?accessToken=${tokens.accessToken}&refreshToken=${tokens.refreshToken}`,
+    );
+  }
+
+  @Get('github')
+  @UseGuards(AuthGuard('github'))
+  githubAuth() {}
+
+  @Get('github/callback')
+  @UseGuards(AuthGuard('github'))
+  async githubAuthCallback(@Req() req: any, @Res() res: Response) {
     const tokens = await this.authService.oauthLogin(req.user);
     const frontendUrl = this.configService.get<string>(
       'FRONTEND_URL',

@@ -10,6 +10,7 @@ import { RedisModule } from 'src/common/redis/redis.module';
 import { JwtStrategy } from './jwt/jwt.strategy';
 import { ClientsModule, Transport } from '@nestjs/microservices';
 import { GoogleStrategy } from './oauth/google.strategy';
+import { GitHubStrategy } from './oauth/github.strategy';
 
 @Module({
   imports: [
@@ -42,7 +43,7 @@ import { GoogleStrategy } from './oauth/google.strategy';
       }),
     }),
   ],
-  providers: [AuthService, JwtStrategy, GoogleStrategy],
+  providers: [AuthService, JwtStrategy, GoogleStrategy, GitHubStrategy],
   controllers: [AuthController],
 })
 export class AuthModule {}
