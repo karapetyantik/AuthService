@@ -93,6 +93,14 @@
     "transform": {
       "^.+\\.(t|j)s$": "ts-jest"
     },
+    "transformIgnorePatterns": [
+      "node_modules/(?!(otplib|@otplib|@scure|@noble)/)"
+    ],
+    "moduleNameMapper": {
+      "^@common/(.*)$": "<rootDir>/common/$1",
+      "^@modules/(.*)$": "<rootDir>/modules/$1",
+      "^@proto/(.*)$": "<rootDir>/proto/$1"
+    },
     "collectCoverageFrom": [
       "**/*.(t|j)s"
     ],

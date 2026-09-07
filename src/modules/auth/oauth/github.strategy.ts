@@ -1,7 +1,10 @@
 import { Injectable } from '@nestjs/common';
 import { PassportStrategy } from '@nestjs/passport';
-import { Strategy, Profile } from 'passport-github2';
 import { ConfigService } from '@nestjs/config';
+import { Strategy, Profile } from 'passport-github2';
+import { OauthUser } from './oauth-user.interface';
+
+type GitHubDone = (err: Error | null, user?: OauthUser) => void;
 
 @Injectable()
 export class GitHubStrategy extends PassportStrategy(Strategy, 'github') {
@@ -13,19 +16,21 @@ export class GitHubStrategy extends PassportStrategy(Strategy, 'github') {
       scope: ['user:email'],
     });
   }
-  async validate(
+
+  validate(
     accessToken: string,
     refreshToken: string,
     profile: Profile,
-    done: (err: any, user: any) => void,
+    done: GitHubDone,
   ) {
     const primaryEmail = profile.emails?.[0]?.value;
 
     if (!primaryEmail) {
-      return done(new Error('No primary email found for GitHub user'), null);
+      done(new Error('No primary email found for GitHub user'));
+      return;
     }
 
-    const user = {
+    const user: OauthUser = {
       providerId: profile.id,
       email: primaryEmail,
       displayName: profile.username ?? profile.displayName,

@@ -5,19 +5,28 @@ import {
   UnauthorizedException,
   BadRequestException,
 } from '@nestjs/common';
+import { JwtService } from '@nestjs/jwt';
+import { ClientProxy } from '@nestjs/microservices';
+import { ConfigService } from '@nestjs/config';
 import * as bcrypt from 'bcrypt';
 import { randomBytes, createHash } from 'crypto';
-import { JwtService } from '@nestjs/jwt';
-import { ConfigService } from '@nestjs/config';
 import ms, { StringValue } from 'ms';
-import { PrismaService } from '../../common/prisma/prisma.service';
+import * as qrcode from 'qrcode';
+import { generateSecret, generateURI, verify } from 'otplib';
+import { PrismaService } from '@common/prisma/prisma.service';
+import { EmailService } from '@modules/email/email.service';
+import { RedisService } from '@common/redis/redis.service';
 import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
-import { EmailService } from 'src/modules/email/email.service';
-import { RedisService } from 'src/common/redis/redis.service';
-import { generateSecret, generateURI, verify } from 'otplib';
-import * as qrcode from 'qrcode';
-import { ClientProxy } from '@nestjs/microservices';
+import { OauthUser } from './oauth/oauth-user.interface';
+
+const OAUTH_EXCHANGE_TTL_SECONDS = 60;
+const MAX_USERNAME_GENERATION_ATTEMPTS = 50;
+
+export interface AuthTokens {
+  accessToken: string;
+  refreshToken: string;
+}
 
 @Injectable()
 export class AuthService {
@@ -58,7 +67,8 @@ export class AuthService {
       username: user.username,
     });
 
-    const { passwordHash: _, ...safeUser } = user;
+    const { passwordHash: hash, ...safeUser } = user;
+    void hash;
     return safeUser;
   }
 
@@ -73,9 +83,6 @@ export class AuthService {
           : 'Неверный email или пароль',
       );
     }
-    // else if (user.isEmailVerified === false) {
-    //   throw new UnauthorizedException('Email not verified');
-    // }
 
     const isPasswordValid = await bcrypt.compare(
       dto.password,
@@ -150,38 +157,34 @@ export class AuthService {
     return this.issueTokens(user.id, user.email);
   }
 
-  async oauthLogin(googleUser: {
-    providerId: string;
-    email: string;
-    displayName: string;
-  }) {
+  async oauthLogin(oauthUser: OauthUser, provider: 'google' | 'github') {
     let user = await this.prisma.user.findUnique({
-      where: { providerId: googleUser.providerId },
+      where: { providerId: oauthUser.providerId },
     });
 
     if (!user) {
       const existingByEmail = await this.prisma.user.findUnique({
-        where: { email: googleUser.email },
+        where: { email: oauthUser.email },
       });
       if (existingByEmail) {
         user = await this.prisma.user.update({
           where: { id: existingByEmail.id },
           data: {
-            provider: 'google',
-            providerId: googleUser.providerId,
+            provider,
+            providerId: oauthUser.providerId,
             isEmailVerified: true,
           },
         });
       } else {
         const username = await this.generateUniqueUsername(
-          googleUser.displayName,
+          oauthUser.displayName,
         );
         user = await this.prisma.user.create({
           data: {
-            email: googleUser.email,
+            email: oauthUser.email,
             username,
-            provider: 'google',
-            providerId: googleUser.providerId,
+            provider,
+            providerId: oauthUser.providerId,
             isEmailVerified: true,
           },
         });
@@ -196,17 +199,54 @@ export class AuthService {
     return this.issueTokens(user.id, user.email);
   }
 
-  private async generateUniqueUsername(base: string): Promise<string> {
-    const cleanBase = base.replace(/\s+/g, '').toLowerCase().slice(0, 20);
-    let username = cleanBase;
-    let attempt = 0;
+  /**
+   * Stores freshly-issued tokens behind a one-time opaque code so OAuth
+   * callbacks can redirect the browser without putting tokens in the URL
+   * (query params leak into browser history / server / proxy logs).
+   */
+  async createOauthExchangeCode(tokens: AuthTokens): Promise<string> {
+    const code = randomBytes(32).toString('hex');
+    await this.redisService.client.set(
+      `oauth_exchange:${code}`,
+      JSON.stringify(tokens),
+      'EX',
+      OAUTH_EXCHANGE_TTL_SECONDS,
+    );
+    return code;
+  }
 
-    while (await this.prisma.user.findUnique({ where: { username } })) {
-      attempt++;
-      username = `${cleanBase}${attempt}`;
+  async exchangeOauthCode(code: string): Promise<AuthTokens> {
+    const key = `oauth_exchange:${code}`;
+    const raw = await this.redisService.client.get(key);
+    if (!raw) {
+      throw new UnauthorizedException('Код обмена недействителен или истёк');
+    }
+    await this.redisService.client.del(key);
+    return JSON.parse(raw) as AuthTokens;
+  }
+
+  private async generateUniqueUsername(base: string): Promise<string> {
+    const cleanBase =
+      base.replace(/\s+/g, '').toLowerCase().slice(0, 20) || 'user';
+    let username = cleanBase;
+
+    for (
+      let attempt = 0;
+      attempt <= MAX_USERNAME_GENERATION_ATTEMPTS;
+      attempt++
+    ) {
+      if (attempt > 0) {
+        username = `${cleanBase}${attempt}`;
+      }
+      const existing = await this.prisma.user.findUnique({
+        where: { username },
+      });
+      if (!existing) {
+        return username;
+      }
     }
 
-    return username;
+    return `${cleanBase}${randomBytes(4).toString('hex')}`;
   }
 
   async resendVerificationEmail(email: string) {
@@ -436,9 +476,8 @@ export class AuthService {
     const refreshToken = randomBytes(40).toString('hex');
 
     const tokenHash = this.hashToken(refreshToken);
-    const refreshTokenExpiry =
-      this.config.get<StringValue>('JWT_REFRESH_EXPIRES_IN') ??
-      ('15d' as StringValue);
+    const refreshTokenExpiry: StringValue =
+      this.config.get<StringValue>('JWT_REFRESH_EXPIRES_IN') ?? '15d';
     const expiresAt = new Date(Date.now() + ms(refreshTokenExpiry));
 
     await this.prisma.refreshToken.create({
