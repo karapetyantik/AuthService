@@ -13,12 +13,12 @@ import { randomBytes, createHash } from 'crypto';
 import ms, { StringValue } from 'ms';
 import * as qrcode from 'qrcode';
 import { generateSecret, generateURI, verify } from 'otplib';
-import { PrismaService } from '@common/prisma/prisma.service';
-import { EmailService } from '@modules/email/email.service';
-import { RedisService } from '@common/redis/redis.service';
 import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
 import { OauthUser } from './oauth/oauth-user.interface';
+import { PrismaService } from '@common/prisma/prisma.service';
+import { RedisService } from '@common/redis/redis.service';
+import { EmailService } from '@modules/email/email.service';
 
 const OAUTH_EXCHANGE_TTL_SECONDS = 60;
 const MAX_USERNAME_GENERATION_ATTEMPTS = 50;
@@ -199,11 +199,6 @@ export class AuthService {
     return this.issueTokens(user.id, user.email);
   }
 
-  /**
-   * Stores freshly-issued tokens behind a one-time opaque code so OAuth
-   * callbacks can redirect the browser without putting tokens in the URL
-   * (query params leak into browser history / server / proxy logs).
-   */
   async createOauthExchangeCode(tokens: AuthTokens): Promise<string> {
     const code = randomBytes(32).toString('hex');
     await this.redisService.client.set(
