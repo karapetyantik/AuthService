@@ -72,16 +72,16 @@ export class AuthService {
     return safeUser;
   }
 
-  async login(dto: LoginDto) {
+  async login(
+    dto: LoginDto,
+  ): Promise<{ requiresTotp: true; tempToken: string } | AuthTokens> {
+    const INVALID_CREDENTIALS_MESSAGE = 'Неверный email или пароль';
     const user = await this.prisma.user.findUnique({
       where: { email: dto.email },
     });
+
     if (!user || !user.passwordHash) {
-      throw new UnauthorizedException(
-        user
-          ? 'Этот аккаунт использует вход через Google'
-          : 'Неверный email или пароль',
-      );
+      throw new UnauthorizedException(INVALID_CREDENTIALS_MESSAGE);
     }
 
     const isPasswordValid = await bcrypt.compare(
@@ -89,7 +89,7 @@ export class AuthService {
       user.passwordHash,
     );
     if (!isPasswordValid) {
-      throw new UnauthorizedException('Invalid email or password');
+      throw new UnauthorizedException(INVALID_CREDENTIALS_MESSAGE);
     }
 
     if (user.isTotpEnabled) {
@@ -445,7 +445,7 @@ export class AuthService {
     return { success: true };
   }
 
-  async refresh(refreshToken: string) {
+  async refresh(refreshToken: string): Promise<AuthTokens> {
     const tokenHash = this.hashToken(refreshToken);
     const stored = await this.prisma.refreshToken.findUnique({
       where: { tokenHash },
@@ -455,8 +455,18 @@ export class AuthService {
     if (!stored || stored.expiresAt < new Date()) {
       throw new UnauthorizedException('Невалидный или истёкший refresh token');
     }
+    if (stored.revokedAt) {
+      await this.prisma.refreshToken.updateMany({
+        where: { userId: stored.userId, revokedAt: null },
+        data: { revokedAt: new Date() },
+      });
+      throw new UnauthorizedException('Невалидный или истёкший refresh token');
+    }
 
-    await this.prisma.refreshToken.delete({ where: { id: stored.id } });
+    await this.prisma.refreshToken.update({
+      where: { id: stored.id },
+      data: { revokedAt: new Date() },
+    });
     return this.issueTokens(stored.user.id, stored.user.email);
   }
 

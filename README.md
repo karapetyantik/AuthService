@@ -12,6 +12,7 @@ AuthService — publisher, не consumer: сам ни на что не подп�
 - **PostgreSQL** через **Prisma** (`@prisma/adapter-pg`)
 - **Redis** (ioredis) — коды подтверждения, rate-limit, TOTP anti-replay, блокировки, OAuth exchange-коды
 - **RabbitMQ** — publisher `user.registered`
+- **@nestjs/schedule** — суточная очистка отозванных refresh-токенов
 - **Passport** (`passport-jwt`, `passport-google-oauth20`, `passport-github2`)
 - **otplib** + **qrcode** — TOTP 2FA
 - **nodemailer** — транзакционные письма (SMTP или Ethereal-заглушка для локальной разработки)
@@ -24,7 +25,9 @@ AuthService — publisher, не consumer: сам ни на что не подп�
 - Двухфакторная аутентификация по TOTP (генерация секрета + QR-код, anti-replay через Redis, блокировка на 24 часа после 5 неверных попыток).
 - Подтверждение email кодом (6 цифр) или по ссылке (JWT-токен, 15 минут).
 - Восстановление пароля с rate-limit (не более 3 писем в час на email) и защитой от email enumeration (единый ответ независимо от того, существует ли аккаунт).
-- Ротация refresh-токенов: каждый `refresh` выдаёт новую пару и инвалидирует старый токен; токены хранятся в БД как SHA-256-хеш, не в открытом виде.
+- Ротация refresh-токенов: каждый `refresh` помечает использованный токен как отозванный (`revokedAt`) и выдаёт новую пару; токены хранятся в БД как SHA-256-хеш, не в открытом виде.
+- Обнаружение повторного использования: если уже отозванный refresh-токен приходит снова (украденный/скомпрометированный токен, реплей) — отзываются ВСЕ активные токены пользователя, а не только этот.
+- Отозванные токены не копятся в таблице бесконечно: ежедневный крон (`TokenCleanupService`, 03:00) удаляет записи, отозванные более 30 дней назад.
 - Глобальный rate-limit через `ThrottlerGuard` (20 запросов/60 сек на IP по умолчанию), отдельные более жёсткие лимиты на `login`/`refresh` (5/мин) и OAuth-обмен (10/мин).
 
 ## API (`/auth/*`)
@@ -97,7 +100,8 @@ src/
     │   ├── dto/     # register, login, refresh, password-*, totp*, verify-email*
     │   ├── jwt/     # JwtStrategy, JwtAuthGuard, AuthenticatedRequest
     │   └── oauth/   # GoogleStrategy, GitHubStrategy, OauthUser
-    └── email/       # EmailService (SMTP / Ethereal fallback)
+    ├── email/       # EmailService (SMTP / Ethereal fallback)
+    └── token-cleanup/  # TokenCleanupService — суточный крон удаления старых revoked refresh-токенов
 ```
 
 ## Запуск
